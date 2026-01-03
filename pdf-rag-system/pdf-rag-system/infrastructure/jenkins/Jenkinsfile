@@ -1,0 +1,124 @@
+pipeline {
+    agent any
+    
+    environment {
+        AWS_REGION = 'us-east-1'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        BACKEND_IMAGE = 'pdf-rag-backend'
+        FRONTEND_IMAGE = 'pdf-rag-frontend'
+        ECS_CLUSTER = 'pdf-rag-cluster'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Test Backend') {
+            steps {
+                dir('backend') {
+                    sh '''
+                        python -m venv venv
+                        . venv/bin/activate
+                        pip install -r requirements.txt
+                        pytest tests/ -v --cov=app --cov-report=xml
+                    '''
+                }
+            }
+            post {
+                always {
+                    publishCoverageReport adapters: [coberturaAdapter('backend/coverage.xml')]
+                }
+            }
+        }
+        
+        stage('Test Frontend') {
+            steps {
+                dir('frontend') {
+                    sh '''
+                        npm ci
+                        npm test -- --coverage --watchAll=false
+                    '''
+                }
+            }
+        }
+        
+        stage('Build Images') {
+            parallel {
+                stage('Build Backend') {
+                    steps {
+                        dir('backend') {
+                            sh "docker build -t ${ECR_REGISTRY}/${BACKEND_IMAGE}:${BUILD_NUMBER} -f ../infrastructure/docker/Dockerfile.backend ."
+                            sh "docker tag ${ECR_REGISTRY}/${BACKEND_IMAGE}:${BUILD_NUMBER} ${ECR_REGISTRY}/${BACKEND_IMAGE}:latest"
+                        }
+                    }
+                }
+                stage('Build Frontend') {
+                    steps {
+                        dir('frontend') {
+                            sh "docker build -t ${ECR_REGISTRY}/${FRONTEND_IMAGE}:${BUILD_NUMBER} -f ../infrastructure/docker/Dockerfile.frontend ."
+                            sh "docker tag ${ECR_REGISTRY}/${FRONTEND_IMAGE}:${BUILD_NUMBER} ${ECR_REGISTRY}/${FRONTEND_IMAGE}:latest"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Push to ECR') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        docker push ${ECR_REGISTRY}/${BACKEND_IMAGE}:${BUILD_NUMBER}
+                        docker push ${ECR_REGISTRY}/${BACKEND_IMAGE}:latest
+                        docker push ${ECR_REGISTRY}/${FRONTEND_IMAGE}:${BUILD_NUMBER}
+                        docker push ${ECR_REGISTRY}/${FRONTEND_IMAGE}:latest
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy to ECS') {
+            when {
+                branch 'main'
+            }
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                    sh '''
+                        aws ecs update-service --cluster ${ECS_CLUSTER} --service pdf-rag-backend --force-new-deployment --region ${AWS_REGION}
+                        aws ecs update-service --cluster ${ECS_CLUSTER} --service pdf-rag-frontend --force-new-deployment --region ${AWS_REGION}
+                        
+                        # Wait for deployment
+                        aws ecs wait services-stable --cluster ${ECS_CLUSTER} --services pdf-rag-backend pdf-rag-frontend --region ${AWS_REGION}
+                    '''
+                }
+            }
+        }
+        
+        stage('Health Check') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    sleep 30
+                    curl -f https://api.pdfrag.example.com/health/ || exit 1
+                '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            slackSend channel: '#deployments', color: 'good', message: "PDF RAG deployment successful: ${env.BUILD_URL}"
+        }
+        failure {
+            slackSend channel: '#deployments', color: 'danger', message: "PDF RAG deployment failed: ${env.BUILD_URL}"
+        }
+    }
+}
